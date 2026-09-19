@@ -54,6 +54,7 @@ import {
   planejarSincronizacao,
   type ModeloExistente,
 } from "@/lib/ai/catalogo/sincronizar";
+import { env } from "@/lib/env";
 import { logger } from "@/lib/logger";
 import { createAdminClient } from "@/lib/supabase/admin";
 
