@@ -30,6 +30,7 @@ const TIMEZONES = [
   "America/Belem",
   "America/Recife",
   "America/Fortaleza",
+  "Europe/Lisbon",
   "UTC",
 ];
 
