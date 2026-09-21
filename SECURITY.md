@@ -2,7 +2,7 @@
 
 ## Versões suportadas
 
-O DeskcommCRM é distribuído em rolling release a partir da branch `main`. Correções de segurança são aplicadas apenas à versão mais recente — mantenha sua instalação atualizada (`bash hostgator-setup-kit/update.sh` em self-host).
+O Task CRM é distribuído em rolling release a partir da branch `main`. Correções de segurança são aplicadas apenas à versão mais recente — mantenha sua instalação atualizada.
 
 | Versão | Suportada |
 | --- | --- |
@@ -13,7 +13,9 @@ O DeskcommCRM é distribuído em rolling release a partir da branch `main`. Corr
 
 **Não abra issue pública para vulnerabilidades.**
 
-Use o [relato privado de vulnerabilidades do GitHub](https://github.com/melgarafael/DeskcommCRM/security/advisories/new) — o relato chega só aos mantenedores, e o histórico fica auditável.
+Use o [relato privado de vulnerabilidades do GitHub](https://github.com/CozmosAI/Task-crm-v2/security/advisories/new) — o relato chega só aos mantenedores, e o histórico fica auditável.
+
+**Contato direto:** cozmos.atendimento@gmail.com
 
 O que esperar:
 
