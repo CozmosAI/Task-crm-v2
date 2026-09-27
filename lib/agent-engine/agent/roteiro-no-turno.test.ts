@@ -42,12 +42,32 @@ const GRAFO_SIM_NAO: FlowGraph = {
 };
 
 /** Banco fake: um roteiro 'coletando' passa a existir quando alguém o insere. */
-function banco(opts: { roteiroJaExiste?: boolean; grafo?: FlowGraph } = {}) {
+function banco(
+  opts: {
+    roteiroJaExiste?: boolean;
+    grafo?: FlowGraph;
+    /** A linha da mensagem do turno, como o roteiro a lê (legenda + derivado da mídia). */
+    mensagem?: { body: string | null; media_derived_text?: string | null } | null;
+    /** Perguntas já feitas ao cliente (eventos `roteiro_pergunta_feita`). */
+    perguntasFeitas?: string[];
+    /** Tentativas por pergunta (eventos `roteiro_tentativa`) — no teto, a pergunta esgota. */
+    tentativas?: Record<string, number>;
+    /** O LOTE inteiro (rajada): vence `mensagem` quando presente. */
+    lote?: Array<{ id: string; body: string | null; media_derived_text?: string | null }>;
+  } = {},
+) {
   const GRAFO_DO_BANCO = opts.grafo ?? GRAFO;
+  const mensagem =
+    opts.mensagem === undefined ? { body: 'quero financiar, meu nome é Lia Mendes', media_derived_text: null } : opts.mensagem;
   let existe = opts.roteiroJaExiste ?? false;
   const sqls: string[] = [];
-  const query = vi.fn(async (sql: string, _params: unknown[] = []) => {
+  const chaves = new Set<string>();
+  const query = vi.fn(async (sql: string, params: unknown[] = []) => {
     sqls.push(sql);
+    if (/insert into followup_enrollment_events/.test(sql) && typeof params[5] === 'string') {
+      if (chaves.has(params[5])) return { rows: [], rowCount: 0 };
+      chaves.add(params[5]);
+    }
     if (/from followup_enrollments e[\s\S]*e\.status = 'coletando'/.test(sql)) {
       return existe
         ? {
@@ -76,6 +96,17 @@ function banco(opts: { roteiroJaExiste?: boolean; grafo?: FlowGraph } = {}) {
     if (/insert into followup_enrollments/.test(sql)) {
       existe = true;
       return { rows: [{ id: 'enr-1' }], rowCount: 1 };
+    }
+    if (/event_type in \('roteiro_tentativa', 'roteiro_pergunta_feita'\)/.test(sql)) {
+      const linhas = [
+        ...(opts.perguntasFeitas ?? []).map((campo) => ({ tipo: 'roteiro_pergunta_feita', campo, n: 1 })),
+        ...Object.entries(opts.tentativas ?? {}).map(([campo, n]) => ({ tipo: 'roteiro_tentativa', campo, n })),
+      ];
+      return { rows: linhas, rowCount: linhas.length };
+    }
+    if (/from messages/.test(sql)) {
+      const linhas = opts.lote ?? (mensagem === null ? [] : [{ id: 'msg-1', ...mensagem }]);
+      return { rows: linhas, rowCount: linhas.length };
     }
     if (/select custom_fields from contacts/.test(sql)) return { rows: [{ custom_fields: {} }], rowCount: 1 };
     if (/insert into followup_enrollment_events|update /.test(sql)) return { rows: [], rowCount: 1 };
@@ -112,7 +143,7 @@ describe('prepararRoteiroDoTurno', () => {
   });
 
   it('sem roteiro e sem palavra-gatilho: null, nada é criado', async () => {
-    const b = banco();
+    const b = banco({ mensagem: { body: 'oi, tudo bem?' } });
     const r = await prepararRoteiroDoTurno(
       { pool: b.pool, moduloLigado: async () => true, validar: semLeitura, log: log() as never },
       { ...turno, texto: 'oi, tudo bem?' },
@@ -134,7 +165,7 @@ describe('prepararRoteiroDoTurno', () => {
   });
 
   it('no turno de início, a captura determinística não roda: "sim, quero financiar" não responde a CNH', async () => {
-    const b = banco({ grafo: GRAFO_SIM_NAO });
+    const b = banco({ grafo: GRAFO_SIM_NAO, mensagem: { body: 'sim, quero financiar' } });
     const r = await prepararRoteiroDoTurno(
       { pool: b.pool, moduloLigado: async () => true, validar: semLeitura, log: log() as never },
       { ...turno, texto: 'sim, quero financiar' },
@@ -160,7 +191,7 @@ describe('prepararRoteiroDoTurno', () => {
   });
 
   it('o roteador começa o roteiro que a intenção aponta, sem olhar palavra-gatilho', async () => {
-    const b = banco();
+    const b = banco({ mensagem: { body: 'oi' } });
     const r = await prepararRoteiroDoTurno(
       { pool: b.pool, moduloLigado: async () => true, validar: semLeitura, log: log() as never },
       { ...turno, texto: 'oi', flowPointerDoRoteador: 'ptr-1' },
@@ -170,7 +201,7 @@ describe('prepararRoteiroDoTurno', () => {
   });
 
   it('o log do turno nunca leva o texto do cliente nem o valor lido', async () => {
-    const b = banco({ roteiroJaExiste: true });
+    const b = banco({ roteiroJaExiste: true, mensagem: { body: 'meu CPF é 529.982.247-25 e sou Lia Mendes' } });
     const l = log();
     await prepararRoteiroDoTurno(
       {
@@ -200,6 +231,144 @@ describe('prepararRoteiroDoTurno', () => {
     );
     expect(r).toBeNull();
     expect(l.warn).toHaveBeenCalled();
+  });
+});
+
+describe('mídia e retry (achado 8 da prova; revisão do PR 1)', () => {
+  it('figurinha ou áudio sem transcrição: nem tentativa, nem validador', async () => {
+    const b = banco({ roteiroJaExiste: true, mensagem: { body: null, media_derived_text: null } });
+    const validar = vi.fn(semLeitura);
+    const r = await prepararRoteiroDoTurno(
+      { pool: b.pool, moduloLigado: async () => true, validar, log: log() as never },
+      { ...turno, texto: '[sticker]' },
+    );
+    expect(r).not.toBeNull();
+    expect(validar).not.toHaveBeenCalled();
+    // A mensagem é reivindicada (o retry não a relê), mas nada conta tentativa.
+    const tipos = b.query.mock.calls
+      .filter(([sql]) => /insert into followup_enrollment_events/.test(String(sql)))
+      .map(([, params]) => (params as unknown[])[3]);
+    expect(tipos).toEqual(['roteiro_mensagem']);
+  });
+
+  it('áudio TRANSCRITO: o roteiro lê a transcrição, sem o enquadramento do histórico', async () => {
+    const b = banco({ roteiroJaExiste: true, mensagem: { body: null, media_derived_text: 'meu nome é Lia Mendes' } });
+    const validar = vi.fn(semLeitura);
+    await prepararRoteiroDoTurno(
+      { pool: b.pool, moduloLigado: async () => true, validar, log: log() as never },
+      { ...turno, texto: '[Mídia do cliente: ele enviou um áudio…]\nConteúdo: meu nome é Lia Mendes' },
+    );
+    expect(validar).toHaveBeenCalledWith(expect.objectContaining({ textoAtual: 'meu nome é Lia Mendes' }));
+  });
+
+  it('retry da mesma mensagem não chama o validador de novo', async () => {
+    const b = banco({ roteiroJaExiste: true });
+    const validar = vi.fn(semLeitura);
+    const deps = { pool: b.pool, moduloLigado: async () => true, validar, log: log() as never };
+    await prepararRoteiroDoTurno(deps, turno);
+    await prepararRoteiroDoTurno(deps, turno);
+    expect(validar).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('revisão adversarial do PR 2 — dado inventado', () => {
+  it('⭐ turno que COMEÇA o roteiro: "sim, quero financiar" não vira tem_cnh = true', async () => {
+    const b = banco({ grafo: GRAFO_SIM_NAO, mensagem: { body: 'sim, quero financiar' } });
+    const validar = vi.fn<ValidarResposta>(async () => ({ resultado: 'nao_respondeu' }));
+    const r = await prepararRoteiroDoTurno(
+      { pool: b.pool, moduloLigado: async () => true, validar, log: log() as never },
+      { ...turno, texto: 'sim, quero financiar' },
+    );
+    // Nenhuma pergunta foi feita: não há "pergunta atual" para o validador.
+    expect(validar).toHaveBeenCalledWith(expect.objectContaining({ perguntaAtual: null }));
+    expect(b.sqls.some((s) => /update contacts/.test(s))).toBe(false);
+    expect(r?.estado.situacao.pendentes.map((n) => n.config.key)).toEqual(['tem_cnh']);
+  });
+
+  it('pergunta já FEITA é a pergunta atual no turno seguinte', async () => {
+    const b = banco({
+      roteiroJaExiste: true,
+      grafo: GRAFO_SIM_NAO,
+      mensagem: { body: 'sim' },
+      perguntasFeitas: ['tem_cnh'],
+    });
+    const validar = vi.fn<ValidarResposta>(async () => ({ resultado: 'nao_respondeu' }));
+    await prepararRoteiroDoTurno(
+      { pool: b.pool, moduloLigado: async () => true, validar, log: log() as never },
+      { ...turno, texto: 'sim' },
+    );
+    expect(validar).toHaveBeenCalledWith(expect.objectContaining({ perguntaAtual: 'tem_cnh' }));
+  });
+
+  it('⭐ RESPOSTA TARDIA (#1130, @vgamkt): a pergunta esgotada vai ao validador, e o que ele leu é gravado', async () => {
+    // Duas perguntas: `cidade` já bateu no teto (3 de 3) e está ENCERRADA; a
+    // CNH segue pendente, então o roteiro continua vivo.
+    const grafo: FlowGraph = {
+      ...GRAFO,
+      nodes: [
+        GRAFO.nodes[0]!,
+        {
+          id: 'c1',
+          type: 'collect',
+          label: 'Cidade',
+          position: { x: 0, y: 0 },
+          config: { key: 'cidade', label: 'Cidade', type: 'text', required: true, permite_correcao: false },
+        },
+        {
+          id: 'c2',
+          type: 'collect',
+          label: 'CNH',
+          position: { x: 0, y: 0 },
+          config: { key: 'tem_cnh', label: 'Tem CNH', type: 'boolean', required: true, permite_correcao: false },
+        },
+        GRAFO.nodes[2]!,
+      ],
+      edges: [
+        { id: 'a', source: 't', target: 'c1', priority: 0, condition: { type: 'always' } },
+        { id: 'b', source: 'c1', target: 'c2', priority: 0, condition: { type: 'always' } },
+        { id: 'c', source: 'c2', target: 'e', priority: 0, condition: { type: 'always' } },
+      ],
+    };
+    const b = banco({
+      roteiroJaExiste: true,
+      grafo,
+      mensagem: { body: 'ah, eu moro em Campinas' },
+      perguntasFeitas: ['cidade', 'tem_cnh'],
+      tentativas: { cidade: 3 },
+    });
+    const validar = vi.fn<ValidarResposta>(async () => ({
+      resultado: 'respondeu',
+      respostas: [{ campo: 'cidade', valor: 'Campinas' }],
+    }));
+    await prepararRoteiroDoTurno(
+      { pool: b.pool, moduloLigado: async () => true, validar, log: log() as never },
+      { ...turno, texto: 'ah, eu moro em Campinas' },
+    );
+
+    const args = validar.mock.calls[0]![0];
+    expect(args.perguntas.map((p) => p.key)).toEqual(['tem_cnh']);
+    expect(args.esgotados?.map((p) => p.key)).toEqual(['cidade']);
+    const gravacao = b.query.mock.calls.find(([sql]) => /update contacts/.test(sql));
+    expect(gravacao, 'a resposta tardia precisa chegar ao contato').toBeDefined();
+    expect(gravacao![1]).toEqual(expect.arrayContaining(['cidade', 'Campinas']));
+  });
+
+  it('⭐ rajada "oi" + "meu cpf é 529.982.247-25": o validador lê o LOTE, e o retry não relê', async () => {
+    const b = banco({
+      roteiroJaExiste: true,
+      lote: [
+        { id: 'm1', body: 'oi' },
+        { id: 'm2', body: 'meu cpf é 529.982.247-25' },
+      ],
+    });
+    const validar = vi.fn<ValidarResposta>(async () => ({ resultado: 'nao_respondeu' }));
+    const deps = { pool: b.pool, moduloLigado: async () => true, validar, log: log() as never };
+    await prepararRoteiroDoTurno(deps, { ...turno, messageId: 'm1', texto: 'oi' });
+    expect(validar).toHaveBeenCalledWith(
+      expect.objectContaining({ textoAtual: 'oi\nmeu cpf é 529.982.247-25' }),
+    );
+    await prepararRoteiroDoTurno(deps, { ...turno, messageId: 'm1', texto: 'oi' });
+    expect(validar).toHaveBeenCalledTimes(1);
   });
 });
 

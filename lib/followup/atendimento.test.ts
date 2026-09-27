@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type pg from "pg";
 
 import type { FlowEdge, FlowGraph, FlowNode } from "./graph-schema";
@@ -8,6 +8,7 @@ import {
   melhorFluxoPorGatilho,
   montarResumoDoRoteiro,
   processarInboundDoFluxo,
+  encerrarRoteirosVencidos,
   renderBlocoDeAtendimento,
   situacaoDoChecklist,
   valoresDoChecklist,
@@ -191,6 +192,10 @@ function estadoCom(
   checklist: ChecklistDeAtendimento,
   valores: Record<string, string> = {},
   tentativas: Record<string, number> = {},
+  // Padrão: toda pergunta já foi feita (o turno comum). `new Set()` = nenhuma.
+  perguntasFeitas: ReadonlySet<string> = new Set(
+    checklist.passos.flatMap((p) => (p.kind === "collect" ? [p.node.config.key] : [])),
+  ),
 ): EstadoDeAtendimento {
   return {
     enrollment: {
@@ -205,6 +210,7 @@ function estadoCom(
     checklist,
     valores,
     tentativas,
+    perguntasFeitas,
     maxTentativas: 3,
     situacao: situacaoDoChecklist(checklist, new Set(Object.keys(valores)), { tentativas, maxTentativas: 3 }),
   };
@@ -377,6 +383,38 @@ describe("processarInboundDoFluxo — gravação e trilha", () => {
     expect(params[i]![2]).toBe("exhausted");
   });
 
+  it("RESPOSTA TARDIA (#1130, @vgamkt): pergunta ESGOTADA aceita o valor que o validador leu", async () => {
+    // `cidade` no teto (3 de 3) = esgotada; `cnh` segue pendente.
+    const { pool, sqls, params, eventos } = poolFake();
+    const estado = estadoCom(cidadeECnh(), {}, { cidade: 3 });
+    expect(estado.situacao.esgotadas.map((n) => n.config.key)).toEqual(["cidade"]);
+
+    await processarInboundDoFluxo(pool, {
+      organizationId: ORG,
+      estado,
+      texto: "ah, eu moro em Campinas",
+      messageId: "m1",
+      validacoes: [{ campo: "cidade", valor: "Campinas" }],
+    });
+
+    const i = sqls.findIndex((s) => /update contacts/.test(s));
+    expect(i, "o valor tardio precisa ser gravado no contato").toBeGreaterThanOrEqual(0);
+    expect(params[i]).toEqual([ORG, "ct", "cidade", "Campinas"]);
+    expect(eventos().map((e) => e.tipo)).toContain("roteiro_resposta");
+  });
+
+  it("controle: campo fora do roteiro continua descartado", async () => {
+    const { pool, sqls } = poolFake();
+    await processarInboundDoFluxo(pool, {
+      organizationId: ORG,
+      estado: estadoCom(cidadeECnh(), {}, { cidade: 3 }),
+      texto: "meu cpf é 529.982.247-25",
+      messageId: "m1",
+      validacoes: [{ campo: "cpf", valor: "52998224725" }],
+    });
+    expect(sqls.some((s) => /update contacts/.test(s))).toBe(false);
+  });
+
   it("tudo respondido fecha como converted, não 'Esgotado'", async () => {
     const c = lista([trigger("t"), collect("c1", "cidade"), end("e")], [aresta("t", "c1"), aresta("c1", "e")]);
     const { pool, sqls, params } = poolFake();
@@ -443,3 +481,44 @@ describe("montarResumoDoRoteiro (passa-bastão e tela, D4 — sem síntese por m
     expect(renderBlocoDeAtendimento(estadoCom(cidadeECnh()))).not.toContain("Contexto do atendimento anterior");
   });
 });
+
+describe("encerrarRoteirosVencidos (prazo, 0397)", () => {
+  it("chama a função do banco com o lote e devolve quantos encerrou", async () => {
+    const rpc = vi.fn(async () => ({ data: 3, error: null }));
+    expect(await encerrarRoteirosVencidos({ rpc }, 50)).toBe(3);
+    expect(rpc).toHaveBeenCalledWith("fn_encerrar_roteiros_vencidos", { p_limite: 50 });
+  });
+
+  it("erro do banco sobe — quem chama loga, não engole calado", async () => {
+    const rpc = vi.fn(async () => ({ data: null, error: { message: "permission denied" } }));
+    await expect(encerrarRoteirosVencidos({ rpc })).rejects.toThrow("permission denied");
+  });
+});
+
+describe("pergunta que não foi feita (revisão adversarial do PR 2)", () => {
+  const cnh = () =>
+    lista(
+      [trigger("t"), no({ id: "c1", type: "collect", config: { key: "tem_cnh", label: "Tem CNH", type: "boolean", required: true, permite_correcao: true } }), end("e")],
+      [aresta("t", "c1"), aresta("c1", "e")],
+    );
+
+  it('"sim" sem a pergunta feita: nem resposta, nem tentativa', async () => {
+    const { pool, sqls, eventos } = poolFake();
+    const r = await processarInboundDoFluxo(pool, {
+      organizationId: ORG,
+      estado: estadoCom(cnh(), {}, {}, new Set()),
+      texto: "sim",
+      messageId: "m1",
+    });
+    expect(r.concluiu).toBe(false);
+    expect(sqls.some((q) => /update contacts/.test(q))).toBe(false);
+    expect(eventos().map((e) => e.tipo)).toEqual(["roteiro_mensagem"]);
+  });
+
+  it('com a pergunta feita, o mesmo "sim" responde', async () => {
+    const { pool, sqls } = poolFake();
+    await processarInboundDoFluxo(pool, { organizationId: ORG, estado: estadoCom(cnh()), texto: "sim", messageId: "m1" });
+    expect(sqls.some((q) => /update contacts/.test(q))).toBe(true);
+  });
+});
+
