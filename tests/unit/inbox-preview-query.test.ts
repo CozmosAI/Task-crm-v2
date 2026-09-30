@@ -12,7 +12,7 @@ describe("contrato PostgREST da última mensagem no preview", () => {
     const sb = createClient("https://qa.invalid", "qa-not-a-secret", { global: { fetch } });
     await listConversationsHandler(sb, {
       organization_id: "qa-org", requestId: "qa-request", actor: { type: "user", id: "qa-user" },
-    }, { limit: 5, status: undefined, comando: undefined });
+    }, { limit: 5, status: undefined, comando: undefined, tag: undefined, modo: undefined });
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(url.searchParams.get("select")).toContain("latest_message:messages!messages_conversation_id_fkey(type,body,sent_at,revoked_at)");
     expect(url.searchParams.get("latest_message.limit")).toBe("1");
