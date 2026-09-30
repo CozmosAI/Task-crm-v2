@@ -76,8 +76,25 @@ const nextConfig: NextConfig = {
   poweredByHeader: false,
   // typedRoutes moved out of experimental in Next 15.5+
   typedRoutes: true,
+  // O typecheck EMBUTIDO do `next build` não cabe no builder free do Render
+  // (~2GB): desde ~v1.67 o tsc do projeto (com typedRoutes gerando tipos de
+  // rota) estoura a RAM e o builder morre com OOM silencioso logo após
+  // "Running TypeScript ..." — sem uma linha de erro no log. O gate de tipos
+  // NÃO desaparece: roda LOCALMENTE (tsc -p tsconfig.typecheck.json, 8GB de
+  // heap) antes de todo push, exatamente como o CI do upstream roda antes de
+  // todo merge. Aqui só evitamos repetir o mesmo trabalho num ambiente que
+  // não tem RAM pra ele. Se um dia o Render der builder com mais memória,
+  // remover isto devolve o duplo cheque.
+  typescript: { ignoreBuildErrors: true },
+  // Build no Render free (~2GB): o `next build` paraleliza a coleta de dados de
+  // página por CPU — 47 workers num host de 47 núcleos é OOM garantido em 2GB
+  // de RAM (medido: "Collecting page data using 47 workers ..." e builder morto
+  // sem log de erro). `experimental.cpus` limita o paralelismo do build;
+  // 4 workers = o padrão de um host pequeno, suficiente e estável (a coleta é
+  // I/O-bound, CPU extra não acelera o que a RAM limita).
   experimental: {
     optimizePackageImports: ["@phosphor-icons/react", "lucide-react", "date-fns"],
+    cpus: 4,
   },
   images: {
     // O app não usa next/image de fato (só <img> raw); desligar o otimizador
@@ -130,6 +147,22 @@ export default withSentryConfig(nextConfig, {
 
   // Only print logs for uploading source maps in CI
   silent: !process.env.CI,
+
+  // Self-host sem SENTRY_AUTH_TOKEN (VPS, Render): o hook runAfterProductionCompile
+  // do @sentry/nextjs 11 prepara o upload de sourcemaps mesmo sem token e estoura
+  // a memoria de builders pequenos (free tier: build_failed silencioso logo apos
+  // "Compiled successfully"). Sem token NAO HA upload — desativar a fase inteira
+  // (sourcemaps.disable) e o hook que a serve (useRunAfterProductionCompileHook:
+  // default TRUE no Sentry 11 com Turbopack — novidade vs Sentry 10, motivo pelo
+  // qual builds anteriores passavam) e a decisao certa; o upstream self-host
+  // (install.sh) nunca sobe sourcemap. Quem um dia quiser sourcemap no Sentry
+  // cadastra SENTRY_AUTH_TOKEN e as duas fases voltam a rodar.
+  ...(process.env.SENTRY_AUTH_TOKEN
+    ? {}
+    : {
+        sourcemaps: { disable: true },
+        useRunAfterProductionCompileHook: false,
+      }),
 
   // For all available options, see:
   // https://docs.sentry.io/platforms/javascript/guides/nextjs/manual-setup/
